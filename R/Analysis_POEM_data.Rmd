@@ -1,0 +1,1572 @@
+---
+title: "Analysis_POEM_data"
+author: "Inés M. Alonso-Crespo, Benjamin Delory"
+date: '2023-11-12'
+output: 
+  html_document: 
+    toc: yes
+    toc_float: yes
+    toc_depth: 5
+    fig_caption: yes
+    df_print: kable
+editor_options: 
+  chunk_output_type: console
+---
+
+Data analysis code supporting the results described in Alonso-Crespo et al (2024) Exploring priority and year effects on plant diversity, productivity and vertical root distribution: first insights from a grassland field experiment.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load R packages
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(POEM) #Not open-access (contact corresponding authors)
+library(vegan)
+library(Hmisc)
+library(ggConvexHull)
+library(hillR)
+library(emmeans)
+library(mgcv)
+library(ggpubr)
+library(viridis)
+library(gtools)
+library(ggnewscale)
+library(mgcv)
+```
+
+## Load POEM color palette
+
+```{r}
+colors<-POEM_col()
+```
+
+## Load POEM shoot data (data)
+
+```{r message=FALSE, warning=FALSE}
+data<-POEM_shoot_biomass_data(paths=list("Data/POEM2020/Data_Biomass_POEM2020_2020-07.xlsx",
+                                         "Data/POEM2020/Data_Biomass_POEM2020_2021-06.xlsx",
+                                         "Data/POEM2020/Data_Biomass_POEM2020_2022-06.xlsx",
+                                         "Data/POEM2021/Data_Biomass_POEM2021_2021-07.xlsx",
+                                         "Data/POEM2021/Data_Biomass_POEM2021_2022-06.xlsx",
+                                         "Data/POEM2021/Data_Biomass_POEM2021_2023-06.xlsx"),
+                              type="mixtures",
+                              export=FALSE)
+
+data<-data %>%
+  dplyr::select(-Unknown)
+
+data$Year_Exp <- paste(data$Name_growing_season, data$Year, sep = "_POEM")
+```
+
+## Load POEM species presence/absence data (data_binary)
+
+```{r}
+data_binary<-gtools::smartbind(data.frame(read_excel("Data/POEM2020/Data_presence-absence_species_POEM2020_2021.xlsx")),
+                               data.frame(read_excel("Data/POEM2020/Data_presence-absence_species_POEM2020_2022.xlsx")),
+                               data.frame(read_excel("Data/POEM2021/Data_presence-absence_species_POEM2021_2021.xlsx")),
+                               data.frame(read_excel("Data/POEM2021/Data_presence-absence_species_POEM2021_2022.xlsx")),
+                               data.frame(read_excel("Data/POEM2021/Data_presence-absence_species_POEM2021_2023.xlsx")),
+                               fill=0)
+
+colnames(data_binary)[9:ncol(data_binary)]<-str_replace(colnames(data_binary)[9:ncol(data_binary)], 
+                                                        pattern = "[.]", 
+                                                        replacement = " ")
+rownames(data_binary)<-1:nrow(data_binary)
+
+#Calculate total species richness
+
+data_binary$Species_richness<-apply(data_binary[,9:ncol(data_binary)], 1, sum)
+```
+
+## Check presence/absence data
+
+Make sure that a species is present (recorded as 1 in the presence/absence data) if it has a biomass value > 0.
+
+```{r}
+species<-colnames(data_binary)[9:68]
+
+k<-0 #Counter
+
+for (sp in species){
+  
+  if (sp %in% colnames(data)){
+  
+    for (i in 1:nrow(data)){
+      
+      experiment<-data$Name_experiment[i]
+      season<-data$Name_growing_season[i]
+      plot<-data$Plot[i]
+      
+      biomass<-data[i, sp]
+      score<-data_binary[which(data_binary$Name_experiment==experiment &
+                                 data_binary$Name_growing_season==season &
+                                 data_binary$Plot==plot), sp]
+      
+      if (length(score)>0){
+      
+        if (biomass>0 & score==0) {
+          
+          #Correct score value
+          
+          k<-k+1
+          
+          data_binary[which(data_binary$Name_experiment==experiment &
+                                   data_binary$Name_growing_season==season &
+                                   data_binary$Plot==plot), sp]<-1
+          
+          message(paste("In ", season, ", ", sp, " is present in plot ", plot, ". Value set to 1.", sep=""))
+          
+        }
+      
+      }}}
+}
+
+message(paste("Total number of corrections: ", k, sep=""))
+
+remove(experiment, i, k, plot, score, season, sp, species, biomass)
+```
+
+## Non-metric multidimensional scaling (NMDS)
+
+### Main text
+
+#### NMDS using plant biomass data
+
+```{r fig.height=5.12, fig.width=7.09, fig.align="center", message=FALSE, warning=FALSE}
+#Run NMDS using plant biomass data (data)
+
+set.seed(123)
+NMDS <- metaMDS(data[,c(9:57)], 
+                distance = "bray", 
+                k=2, 
+                trymax=5000)
+
+data<-cbind(data, NMDS$points)
+
+NMDS.mean<-data %>%
+  group_by(Name_experiment, Name_growing_season, Arrival) %>%
+  summarise(Total_biomass=mean(Total_biomass),
+            ci1=list(mean_cl_boot(MDS1) %>%
+                      rename(MDS1=y, 
+                             lwr.MDS1=ymin, 
+                             upr.MDS1=ymax)),
+            ci2=list(mean_cl_boot(MDS2) %>%
+                      rename(MDS2=y, 
+                             lwr.MDS2=ymin, 
+                             upr.MDS2=ymax))) %>%
+  unnest(cols = c(ci1, ci2))
+
+NMDS.mean$Group<-paste(NMDS.mean$Name_experiment, NMDS.mean$Arrival, sep="-") 
+
+#Plot NMDS
+           
+(p2.a<-ggplot(NMDS.mean, aes(x=MDS1, y=-MDS2, colour=Arrival, fill=Arrival, 
+                           shape=Name_experiment, group=Group))+
+  geom_hline(yintercept=0, linetype=2)+
+  geom_vline(xintercept = 0, linetype=2)+
+  geom_segment(aes(x=MDS1, 
+                   xend=MDS1, 
+                   y=-lwr.MDS2, 
+                   yend=-upr.MDS2), 
+               color="grey90")+
+  geom_segment(aes(y=-MDS2, 
+                   yend=-MDS2, 
+                   x=lwr.MDS1, 
+                   xend=upr.MDS1), color="grey80")+
+  geom_path(arrow = arrow(angle=25,
+                          length = unit(0.3, "cm"),
+                          type="closed"))+
+  geom_point(aes(size=Total_biomass))+
+  theme_bw()+
+  theme(axis.title.y=element_text(margin=margin(r=10)),
+        axis.title.x=element_text(margin=margin(t=10)),
+        axis.text=element_text(colour = "black", size=11),
+        axis.title=element_text(size=12),
+        strip.text = element_text(size=12),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.key.size = unit(0.5, "cm"))+
+  scale_shape_manual(values=c(21,22), 
+                     name="Year of initiation",
+                     labels=c("2020", "2021"))+
+  scale_color_manual(values=colors, 
+                     name="PFG order of arrival",
+                     labels=c("Synchronous",
+                              "Forbs sown first",
+                              "Grasses sown first",
+                              "Legumes sown first",
+                              "Free succession"))+
+  scale_fill_manual(values=alpha(colors, 0.7), 
+                    name="PFG order of arrival",
+                    labels=c("Synchronous",
+                              "Forbs sown first",
+                              "Grasses sown first",
+                              "Legumes sown first",
+                              "Free succession"))+
+  scale_size_continuous(name="Shoot productivity\n(g/m²)")+
+  ylab("NMDS2")+
+  xlab("NMDS1")+
+  guides(shape=guide_legend(order=1, override.aes = list(size=4)),
+         color=guide_legend(order=2),
+         fill=guide_legend(order=2),
+         size=guide_legend(order=3)))
+
+# ggsave("Figure2a.png",
+#        dpi=1000,
+#        width=18,
+#        height=12,
+#        units="cm")
+
+```
+
+```{r}
+#Overall PERMANOVA
+set.seed(123)
+(permanova<-vegan::adonis2(wisconsin(sqrt(data[,c(9:57)]))~Arrival*Name_growing_season*Name_experiment,
+                          data=data,
+                          method="bray",
+                          permutations = 1000))
+
+#PERMANOVA without free succession plots
+data_no_B<-data %>% 
+  filter(Arrival != "B")
+
+set.seed(123)
+(permanova<-vegan::adonis2(wisconsin(sqrt(data_no_B[,c(9:57)]))~Arrival*Name_growing_season*Name_experiment,
+                          data=data_no_B,
+                          method="bray",
+                          permutations = 1000))
+```
+
+#### NMDS using presence/absence data
+
+```{r}
+#Run NMDS using species presence-absence (data_binary)
+
+set.seed(123)
+NMDS2.b <- metaMDS(data_binary[,c(9:68)], 
+                distance = "jaccard", 
+                k=2, 
+                trymax=1000)
+
+data_binary<-cbind(data_binary, NMDS2.b$points)
+
+NMDS.mean.2<-data_binary %>%
+  group_by(Name_experiment, Name_growing_season, Arrival) %>%
+  summarise(Species_richness=mean(Species_richness),
+            ci1=list(mean_cl_boot(MDS1) %>%
+                      rename(MDS1=y, 
+                             lwr.MDS1=ymin, 
+                             upr.MDS1=ymax)),
+            ci2=list(mean_cl_boot(MDS2) %>%
+                      rename(MDS2=y, 
+                             lwr.MDS2=ymin, 
+                             upr.MDS2=ymax))) %>%
+  unnest(cols = c(ci1, ci2))
+
+NMDS.mean.2$Group<-paste(NMDS.mean.2$Name_experiment, NMDS.mean.2$Arrival, sep="-") 
+
+#Plot NMDS
+           
+(p2.b<-ggplot(NMDS.mean.2, aes(x=MDS1, y=-MDS2, colour=Arrival, fill=Arrival, 
+                           shape=Name_experiment, group=Group))+
+  geom_hline(yintercept=0, linetype=2)+
+  geom_vline(xintercept = 0, linetype=2)+
+  geom_segment(aes(x=MDS1, 
+                   xend=MDS1, 
+                   y=-lwr.MDS2, 
+                   yend=-upr.MDS2), 
+               color="grey90")+
+  geom_segment(aes(y=-MDS2, 
+                   yend=-MDS2, 
+                   x=lwr.MDS1, 
+                   xend=upr.MDS1), color="grey80")+
+  geom_path(arrow = arrow(angle=25,
+                          length = unit(0.3, "cm"),
+                          type="closed"))+
+  geom_point(aes(size=Species_richness))+
+  theme_bw()+
+  theme(axis.title.y=element_text(margin=margin(r=10)),
+        axis.title.x=element_text(margin=margin(t=10)),
+        axis.text=element_text(colour = "black", size=11),
+        axis.title=element_text(size=12),
+        strip.text = element_text(size=12),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.key.size=unit(0.5, "cm"))+
+  scale_shape_manual(values=c(21,22), 
+                     name="Year of initiation",
+                     labels=c("2020", "2021"))+
+  scale_color_manual(values=colors, 
+                     name="PFG order of arrival",
+                     labels=c("Synchronous",
+                              "Forbs sown first",
+                              "Grasses sown first",
+                              "Legumes sown first",
+                              "Free succession"))+
+  scale_fill_manual(values=alpha(colors, 0.7), 
+                    name="PFG order of arrival",
+                    labels=c("Synchronous",
+                              "Forbs sown first",
+                              "Grasses sown first",
+                              "Legumes sown first",
+                              "Free succession"))+
+  scale_size_continuous(name="Species richness")+
+  ylab("NMDS2")+
+  xlab("NMDS1")+
+  guides(shape="none",
+         color="none",
+         fill="none"))
+```
+
+```{r}
+#Overall PERMANOVA
+(permanova_POEM2020<-vegan::adonis2(data_binary[,c(9:68)]~Arrival*Name_growing_season*Name_experiment,
+                                    data=data_binary,
+                                    method="jaccard",
+                                    permutation=1000))
+```
+
+#### Create NMDS figure
+
+```{r}
+
+Figure2 <- ggarrange(p2.a, p2.b, nrow=2, labels=c("A", "B"), align="hv",
+                     font.label = list(size=18))
+
+# ggsave("Figure2.tiff",
+#        Figure2,
+#        dpi=1000,
+#        compression="lzw",
+#        height=23,
+#        width=17,
+#        units="cm")
+```
+
+## Analyse taxonomic diversity (Hill numbers)
+
+### Main text
+
+```{r fig.height=5.12, fig.width=7.09, fig.align="center", message=FALSE, warning=FALSE}
+#Calculate effective diversity for 0<=q<=2
+
+q.values<-seq(0,2,by=0.05)
+results<-data.frame(matrix(NA, nrow=nrow(data), ncol=length(q.values)))
+i<-0
+
+for (q in q.values) {
+  
+  i<-i+1
+  results[,i]<-hill_taxa(comm=data[,9:57], q=q)}
+
+colnames(results)<-paste("q", q.values, sep="")
+
+data<-cbind(data, results)
+
+data_long<-data %>%
+  pivot_longer(cols=q0:q2, 
+               names_to="q", 
+               names_prefix="q", 
+               values_to = "D", 
+               names_transform = list(q = as.numeric)) %>%
+  separate(Harvest, sep="-", into=c("HarvestYear", "HarvestMonth"))
+```
+
+```{r}
+#Plot raw data
+
+data_long %>%
+  group_by(Name_experiment, Name_growing_season, HarvestYear, Arrival, q) %>%
+  summarise(ci1=list(mean_cl_normal(D) %>%
+                      rename(D=y, 
+                             lwr.D=ymin, 
+                             upr.D=ymax))) %>%
+  unnest(cols = ci1) %>%  
+  ggplot(aes(x=q, y=D, colour=Arrival, fill=Arrival))+
+    geom_ribbon(aes(ymin=lwr.D, ymax=upr.D), color=NA, alpha=0.1)+
+    geom_line(size=1,
+              linewidth=0.6)+
+    facet_wrap(Name_experiment~Name_growing_season~HarvestYear, 
+             nrow=2, 
+             labeller = label_wrap_gen(multi_line=FALSE))+
+    xlab("Diversity order (q)")+
+    ylab("Effective number of species")+
+    theme_bw()+
+    theme(axis.title.y=element_text(margin=margin(r=10)),
+        axis.title.x=element_text(margin=margin(t=10)),
+        axis.text=element_text(colour = "black", size=11),
+        axis.title=element_text(size=12),
+        strip.text = element_text(size=11),
+        legend.text = element_text(size=10),
+        legend.title=element_text(size=11))+
+    scale_color_manual(values=colors, 
+                       name="PFG order of arrival",
+                       labels=c("Synchronous",
+                                "Forbs sown first",
+                                "Grasses sown first",
+                                "Legumes sown first",
+                                "Free succession"))+
+    scale_fill_manual(values=colors, 
+                       name="PFG order of arrival",
+                       labels=c("Synchronous",
+                                "Forbs sown first",
+                                "Grasses sown first",
+                                "Legumes sown first",
+                                "Free succession"))+
+    guides(fill="none")
+
+# ggsave("Figure3.tiff",
+#      dpi=1000,
+#      compression="lzw",
+#      height=13,
+#      width=22,
+#      units="cm")
+```
+
+```{r}
+#Fit GLMER at q=0,q=1 and q=2
+
+#####
+#q=0
+#####
+
+model_q0<-lme4::glmer(D~Arrival*Name_growing_season*Name_experiment + (1|Plot),
+                      data_long[data_long$q==0,],
+                      family=Gamma(link = "log"),
+                      control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=5e5)))
+plot(model_q0)
+summary(model_q0)
+car::Anova(model_q0, type=3)
+
+summary(emmeans(model_q0, 
+                "Arrival", 
+                by=c("Name_experiment", "Name_growing_season"),
+                contr="pairwise"), 
+        type="response")
+
+#####
+#q=1
+#####
+
+model_q1<-lme4::glmer(D~Arrival*Name_growing_season*Name_experiment + (1|Plot),
+                      data_long[data_long$q==1,],
+                      family=Gamma(link="log"),
+                      control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=5e5)))
+plot(model_q1)
+summary(model_q1)
+car::Anova(model_q1, type=3)
+
+summary(emmeans(model_q1, 
+                "Arrival", 
+                by=c("Name_experiment", "Name_growing_season"),
+                contr="pairwise"), 
+        type="response")
+
+#####
+#q=2
+#####
+
+model_q2<-lme4::glmer(D~Arrival*Name_growing_season*Name_experiment + (1|Plot),
+                      data_long[data_long$q==2,],
+                      family=Gamma(link="log"),
+                      control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=5e5)))
+plot(model_q2)
+summary(model_q2)
+car::Anova(model_q2, type=3)
+
+summary(emmeans(model_q2, 
+                "Arrival", 
+                by=c("Name_experiment", "Name_growing_season"),
+                contr="pairwise"), 
+        type="response")
+```
+
+## Analysis of shoot biomass data
+
+### Main text
+
+```{r fig.height=5.12, fig.width=7.09, fig.align="center", message=FALSE, warning=FALSE}
+#Fit GLMER
+
+data$Plot<-as.factor(data$Plot)
+data$Name_experiment<-as.factor(data$Name_experiment)
+data$Name_growing_season<-as.factor(data$Name_growing_season)
+
+model.f4_1<-glmer(Total_biomass~Arrival*Name_growing_season*Name_experiment + (1|Plot),
+              data = data,
+              family=Gamma(link="log"),
+              control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=5e5)))
+
+#Check model residuals
+
+plot(fitted(model.f4_1), resid(model.f4_1)); abline(h=0)
+
+#Check model outputs
+
+summary(model.f4_1)
+car::Anova(model.f4_1, type=3)
+
+#Posthoc tests
+
+summary(emmeans(model.f4_1, 
+                pairwise~Arrival, 
+                by=c("Name_experiment","Name_growing_season")), 
+        type="response")
+
+#Plot results
+
+table_sign<-data.frame(Name_experiment=c(rep("POEM2020", 5), rep("POEM2021", 5)),
+                       Name_growing_season=c(rep("Year 2", 5), rep("Year 2", 5)),
+                       HarvestYear=c(rep(2021, 5), rep(2022, 5)),
+                       Arrival=rep(c("S", "F", "G", "L", "B"), 2),
+                       Label=c("a", "ab", "a", "ab", "b", "a", "ab", "ab", "a", "b"),
+                       y=c(rep(500, 5), rep(500, 5)))
+
+(p4<-data %>%
+    separate(Harvest, sep="-", into=c("HarvestYear", "HarvestMonth")) %>%
+    ggplot(aes(x=Arrival, y=Total_biomass, colour=Arrival))+
+    facet_wrap(Name_experiment~Name_growing_season~HarvestYear, 
+               nrow=2, 
+               labeller = label_wrap_gen(multi_line=FALSE))+
+    geom_jitter(shape=1, width=0.15, height=0, size=1.6)+
+    stat_summary(fun.data = "mean_cl_boot", size=0.4)+
+    theme_bw()+
+    ylab("Shoot dry weight (g/m²)")+
+    xlab("PFG order of arrival")+
+    theme(axis.title.y=element_text(margin=margin(r=10)),
+        axis.title.x=element_text(margin=margin(t=10)),
+        axis.text=element_text(colour = "black", size=11),
+        axis.title=element_text(size=12),
+        strip.text = element_text(size=11),
+        legend.position="none",
+        legend.text = element_text(size=10),
+        legend.title=element_text(size=11))+
+  scale_color_manual(values=colors, 
+                     name="PFG order of arrival",
+                     labels=c("Synchronous",
+                              "Forbs sown first",
+                              "Grasses sown first",
+                              "Legumes sown first",
+                              "Free succession"))+
+    scale_y_continuous(limit = c(0,600), breaks=seq(0,600, by=100))+
+    geom_text(data=table_sign, mapping=aes(x=Arrival, y=y, label=Label), inherit.aes = FALSE))
+    
+#Export high resolution figure
+
+# ggsave("Figure4.tiff",
+#        p4,
+#        dpi=1000,
+#        compression="lzw",
+#        height=13,
+#        width=18,
+#        units="cm")
+```
+
+### Supplementary information
+
+#### Figure S3
+
+```{r}
+(s3.a<-data %>%
+    separate(Harvest, sep="-", into=c("HarvestYear", "HarvestMonth")) %>%
+    ggplot(aes(x=Arrival, y=Total_target_biomass, colour=Arrival))+
+    facet_wrap(Name_experiment~Name_growing_season~HarvestYear, 
+               nrow=2, 
+               labeller = label_wrap_gen(multi_line=FALSE))+
+    geom_jitter(shape=1, width=0.15, height=0, size=1.6)+
+    stat_summary(fun.data = "mean_cl_boot", size=0.4)+
+    scale_color_manual(values=colors)+
+    theme_bw()+
+    ylab("Shoot dry weight of sown species (g/m²)")+
+    xlab("")+
+    theme(axis.title.y=element_text(margin=margin(r=10)),
+          axis.title.x=element_text(margin=margin(t=10)),
+          axis.text=element_text(colour = "black", size=11),
+          axis.title=element_text(size=12),
+          strip.text = element_text(size=11),
+          legend.position="none")+
+    scale_y_continuous(limit = c(0,600), breaks=seq(0,600, by=100)))
+
+(s3.b<-data %>%
+    separate(Harvest, sep="-", into=c("HarvestYear", "HarvestMonth")) %>%
+    ggplot(aes(x=Arrival, y=Total_nontarget_biomass, colour=Arrival))+
+    facet_wrap(Name_experiment~Name_growing_season~HarvestYear, 
+               nrow=2, 
+               labeller = label_wrap_gen(multi_line=FALSE))+
+    geom_jitter(shape=1, width=0.15, height=0, size=1.6)+
+    stat_summary(fun.data = "mean_cl_boot", size=0.4)+
+    scale_color_manual(values=colors)+
+    theme_bw()+
+    ylab("Shoot dry weight of unsown species (g/m²)")+
+    xlab("PFG order of arrival")+
+    theme(axis.title.y=element_text(margin=margin(r=10)),
+          axis.title.x=element_text(margin=margin(t=10)),
+          axis.text=element_text(colour = "black", size=11),
+          axis.title=element_text(size=12),
+          strip.text = element_text(size=11),
+          legend.position="none")+
+    scale_y_continuous(limit = c(0,400), breaks=seq(0,400, by=100)))
+
+```
+
+```{r}
+Figure_s3 <- ggarrange(s3.a, 
+                       s3.b, 
+                       nrow=2, 
+                       labels=c("A", "B"), 
+                       align="hv", 
+                       font.label = list(size=18))
+
+# ggsave("Figure_s3.tiff",
+#         Figure_s3,
+#         dpi=1000,
+#         compression="lzw",
+#         height=23,
+#         width=18,
+#         units="cm")
+```
+
+#### Figure S4
+
+```{r}
+(s4.a<-data %>%
+    separate(Harvest, sep="-", into=c("HarvestYear", "HarvestMonth")) %>%
+    ggplot(aes(x=Arrival, y=Forb_biomass, colour=Arrival))+
+    facet_wrap(Name_experiment~Name_growing_season~HarvestYear, 
+               nrow=2, 
+               labeller = label_wrap_gen(multi_line=FALSE))+
+    geom_jitter(shape=1, width=0.15, height=0, size=1.6)+
+    stat_summary(fun.data = "mean_cl_boot", size=0.4)+
+    scale_color_manual(values=colors)+
+    theme_bw()+
+    ylab("SDW of sown forbs (g/m²)")+
+    xlab("")+
+    theme(axis.title.y=element_text(margin=margin(r=10)),
+          axis.title.x=element_text(margin=margin(t=10)),
+          axis.text=element_text(colour = "black", size=11),
+          axis.title=element_text(size=12),
+          strip.text = element_text(size=11),
+          legend.position="none"))
+
+(s4.b<-data %>%
+    separate(Harvest, sep="-", into=c("HarvestYear", "HarvestMonth")) %>%
+    ggplot(aes(x=Arrival, y=Grass_biomass, colour=Arrival))+
+    facet_wrap(Name_experiment~Name_growing_season~HarvestYear, 
+               nrow=2, 
+               labeller = label_wrap_gen(multi_line=FALSE))+
+    geom_jitter(shape=1, width=0.15, height=0, size=1.6)+
+    stat_summary(fun.data = "mean_cl_boot", size=0.4)+
+    scale_color_manual(values=colors)+
+    theme_bw()+
+    ylab("SDW of sown grasses (g/m²)")+
+    xlab("")+
+    theme(axis.title.y=element_text(margin=margin(r=10)),
+          axis.title.x=element_text(margin=margin(t=10)),
+          axis.text=element_text(colour = "black", size=11),
+          axis.title=element_text(size=12),
+          strip.text = element_text(size=11),
+          legend.position="none"))
+
+(s4.c<-data %>%
+    separate(Harvest, sep="-", into=c("HarvestYear", "HarvestMonth")) %>%
+    ggplot(aes(x=Arrival, y=Leg_biomass, colour=Arrival))+
+    facet_wrap(Name_experiment~Name_growing_season~HarvestYear, 
+               nrow=2, 
+               labeller = label_wrap_gen(multi_line=FALSE))+
+    geom_jitter(shape=1, width=0.15, height=0, size=1.6)+
+    stat_summary(fun.data = "mean_cl_boot", size=0.4)+
+    scale_color_manual(values=colors)+
+    theme_bw()+
+    ylab("SDW of sown legumes (g/m²)")+
+    xlab("PFG order of arrival")+
+    theme(axis.title.y=element_text(margin=margin(r=10)),
+          axis.title.x=element_text(margin=margin(t=10)),
+          axis.text=element_text(colour = "black", size=11),
+          axis.title=element_text(size=12),
+          strip.text = element_text(size=11),
+          legend.position="none"))
+```
+
+```{r}
+Figure_s4 <- ggarrange(s4.a,
+                       s4.b,
+                       s4.c, 
+                       nrow=3, 
+                       labels=c("A", "B", "C"), 
+                       align="hv", 
+                       font.label = list(size=18))
+
+# ggsave("Figure_s4.tiff",
+#         Figure_s4,
+#         dpi=1000,
+#         compression="lzw",
+#         height=26,
+#         width=17,
+#         units="cm")
+```
+
+## Analysis of minirhizotron data
+
+### Load and format root data
+
+```{r message=FALSE, warning=FALSE, fig.align="center"}
+#Load data in R
+data_root_2022<-load_rhizovision_data("Data/Minirhizotrons/2022/features.csv")
+data_root_2023<-load_rhizovision_data("Data/Minirhizotrons/2023/features.csv")
+
+data_root<-rbind(data_root_2022, data_root_2023)
+
+data_root<-data_root[order(data_root$Tube, data_root$Depth_cm, data_root$Days),]
+
+remove(data_root_2022, data_root_2023)
+
+#Define Plot and Tube as factors
+#Arrival is already a factor
+data_root$Plot<-factor(data_root$Plot)
+data_root$Tube<-factor(data_root$Tube)
+
+#Replace NA values by zero
+data_root$Total.Root.Length.mm[is.na(data_root$Total.Root.Length.mm)==TRUE]<-0
+data_root$Network.Area.mm2[is.na(data_root$Network.Area.mm2)==TRUE]<-0
+
+#Calculate average Days values when images were taken on different days
+average_days<-aggregate(data_root$Days, 
+                        by=list(data_root$Session), 
+                        function(x) {mean(range(x))})
+
+data_root$Days<-average_days$x[match(data_root$Session, average_days$Group.1)]
+
+#Calculate root length density and root surface area
+res<-148 #resolution: 148 px/mm
+
+area1_cm2<-(2464/res/10)*(3280/res/10) #Area of an image in cm² (session 1)
+area_cm2<-(2340/res/10)*(2400/res/10) #Area of an image in cm²
+
+#Create empty columns
+data_root$rld_cm.per.cm2<-NA
+data_root$rsd_cm2.per.cm2<-NA
+
+#Calculate RLD and RSD for session 1
+index<-which(data_root$Session==1)
+data_root$rld_cm.per.cm2[index]<-(data_root$Total.Root.Length.mm[index]/10)/area1_cm2
+data_root$rsd_cm2.per.cm2[index]<-(data_root$Network.Area.mm2[index]/100)/area1_cm2
+
+#Calculate RLD and RSD for other sessions
+index<-which(data_root$Session!=1)
+data_root$rld_cm.per.cm2[index]<-(data_root$Total.Root.Length.mm[index]/10)/area_cm2
+data_root$rsd_cm2.per.cm2[index]<-(data_root$Network.Area.mm2[index]/100)/area_cm2
+
+#Correlation between pRLD and pRSD
+ggplot(data_root, aes(x=rld_cm.per.cm2, y=rsd_cm2.per.cm2))+
+  geom_point()+
+  theme_bw()+
+  geom_smooth(method="lm")+
+  stat_cor(cor.coef.name = "r")+
+  xlab("Planar root length density (cm/cm²)")+
+  ylab("Planar root surface density (cm²/cm²)")
+
+#Average tubes in each plot
+data_root<-data_root %>% 
+  group_by(Plot, Arrival, Depth_cm, Days) %>%
+  summarise(rld_cm.per.cm2=mean(rld_cm.per.cm2),
+            rsd_cm2.per.cm2=mean(rsd_cm2.per.cm2))
+```
+
+### Get POEM weather data
+
+```{r message=FALSE, warning=FALSE, fig.align="center"}
+weather<-import_weather_data()
+
+weather<-weather %>% 
+  add_column(Date=as.Date(weather$Time), .after="Time") %>%
+  group_by(Date) %>%
+  filter(Date >= as.Date("2021-04-13")) %>%
+  filter(Date <= as.Date("2023-06-23")) %>%
+  summarise(avg_temp=mean(avg_AirTemp, na.rm=T),
+            min_temp=min(avg_AirTemp, na.rm=T),
+            max_temp=max(avg_AirTemp, na.rm=T),
+            rain_mm=sum(AmountOfPrecipDif, na.rm=T)) %>%
+  add_column(Days=0:799, .after="Date")
+
+#Calculate secondary axis for precipitation data
+min1<-min(weather[,"min_temp"])
+max1<-max(weather[,"max_temp"])
+min2<-min(weather[,"rain_mm"])
+max2<-max(weather[,"rain_mm"])
+slope<-(max2-min2)/(max1-min1)
+
+weather<-weather %>% add_column(new=(weather$rain_mm-min2+slope*min1)/slope)
+```
+
+### Analysis of total root productivity over time
+
+#### Data
+
+```{r message=FALSE, warning=FALSE, fig.align="center"}
+#Calculate average RLD and RSD per plot
+data1<-data_root %>%
+  group_by(Plot, Arrival, Days) %>%
+  summarise(rld_inverseCV=mean(rld_cm.per.cm2)/sd(rld_cm.per.cm2),
+            rsd_inverseCV=mean(rsd_cm2.per.cm2)/sd(rsd_cm2.per.cm2),
+            rld_cm.per.cm2=mean(rld_cm.per.cm2),
+            rsd_cm2.per.cm2=mean(rsd_cm2.per.cm2))
+```
+
+#### Planar root length density
+
+```{r message=FALSE, warning=FALSE, fig.align="center"}
+#Plot raw data
+supp.labs <- c("Forbs sown first (F)", 
+               "Grasses sown first (G)", 
+               "Legumes sown first (L)", 
+               "Synchronous sowing (S)")
+names(supp.labs) <- c("F", "G", "L", "S")
+
+ggplot(data1, aes(y=rld_cm.per.cm2, x=Days, color=Arrival))+
+  geom_smooth(method="loess")+
+  geom_point()+
+  scale_color_manual(values=colors[-5], 
+                     name="PFG order of arrival")+
+  theme_bw()+
+  ylab("Planar root length density (cm/cm²)")+
+  xlab("Time since start (days)")+
+  theme(legend.position = "none",
+        axis.text.x.top = element_text(angle=40, hjust = 0, vjust=0),
+        axis.title.x.top = element_blank(),
+        axis.title.y.left = element_text(margin=margin(r=10)),
+        axis.title.x.bottom = element_text(margin=margin(t=10)),
+        axis.text=element_text(color="black"))+
+  scale_y_continuous(breaks=seq(0,10,by=1))+
+  coord_cartesian(xlim=c(0,800))+
+  facet_wrap(~Arrival, 
+             labeller = labeller(Arrival = supp.labs))
+
+#Fit GAM
+n.time<-length(unique(data_root$Days))
+
+model.f5<-mgcv::gam(rld_cm.per.cm2~Arrival+s(Days, by=Arrival, k=n.time)+s(Plot, bs="re"), 
+                   data = data1, 
+                   family=tw(link="log"))
+
+#Check model fit
+gam.check(model.f5, rep=500)
+summary(model.f5)
+anova(model.f5)
+
+#Create new data to make predictions using GAM
+a<-c("G","S","F","S","L","F","G","S","F","L","L","S","L","F","L","G","G","F","S","G")
+
+n<-length(seq(min(data_root$Days),max(data_root$Days),by=1))
+
+newdata<-data.frame(Days=rep(seq(min(data_root$Days),max(data_root$Days),by=1), 20),
+                    Plot=factor(rep(unique(data_root$Plot), each=n)),
+                    Arrival=factor(rep(a, each=n)))
+
+#Predict without random effect smooths
+newdata$pred<-mgcv::predict.gam(model.f5, 
+                                newdata=newdata, 
+                                type="response", 
+                                se=TRUE, 
+                                exclude=c("s(Plot)"))$fit
+
+newdata$se<-mgcv::predict.gam(model.f5, 
+                              newdata=newdata, 
+                              type="response", 
+                              se=TRUE, 
+                              exclude=c("s(Plot)"))$se.fit
+
+#Predict with random effect smooths
+newdata$pred_all<-mgcv::predict.gam(model.f5, 
+                                    newdata=newdata, 
+                                    type="response", 
+                                    se=TRUE)$fit
+
+newdata$se_all<-mgcv::predict.gam(model.f5, 
+                                  newdata=newdata, 
+                                  type="response", 
+                                  se=TRUE)$se.fit
+
+#Plot results with random effects
+ggplot(data1, aes(y=rld_cm.per.cm2, x=Days, color=Arrival))+
+  geom_line(data=newdata, aes(x=Days, y=pred_all, color=Arrival, group=Plot), 
+            inherit.aes = FALSE, size=0.8)+
+  geom_point(shape=1)+
+  scale_color_manual(values=colors[-5], name="PFG order of arrival")+
+  theme_bw()+
+  ylab("Planar root length density (cm/cm²)")+
+  xlab("Time since start (days)")+
+  theme(legend.position = "bottom",
+        axis.text.x.top = element_text(angle=40, hjust = 0, vjust=0),
+        axis.title.x.top = element_blank(),
+        axis.title.y.left = element_text(margin=margin(r=10)),
+        axis.title.x.bottom = element_text(margin=margin(t=10)),
+        axis.text=element_text(color="black"))+
+  coord_cartesian(xlim=c(0,800))
+```
+
+
+```{r fig.align="center", fig.height=6.3, fig.width=7.09, message=FALSE, warning=FALSE}
+#Plot results and model fit
+p5_1<-ggplot(weather, aes(x=Days, y=avg_temp))+
+  geom_ribbon(aes(ymin=min_temp, ymax=max_temp), 
+              fill="gray50", color=NA, alpha=0.2)+
+  geom_segment(aes(x=Days, xend=Days, y=(0-min2+slope*min1)/slope, yend=new), 
+               colour="steelblue", size=0.6)+
+  geom_line(size=0.3)+
+  theme_bw()+
+  xlab("")+
+  ylab("Temperature (°C)")+
+  theme(axis.title.y.left = element_text(margin=margin(r=10)),
+        axis.title.y.right=element_text(margin = margin(l=10)),
+        axis.text=element_text(color="black"),
+        axis.text.x.top = element_text(angle=90, hjust = 1, vjust=0.5, size=5.5),
+        axis.text.x.bottom = element_text(angle=90, hjust = 1, vjust=0.5, size=5.5),
+        axis.title.x.top = element_blank(),
+        axis.title.x.bottom = element_blank(),
+        panel.grid.minor = element_blank())+
+  scale_x_continuous(breaks=floor(unique(data_root$Days)),
+                     sec.axis = dup_axis(labels = function(x) {weather$Date[match(floor(x), weather$Days)]}))+
+  scale_y_continuous(sec.axis=sec_axis(~.*slope+min2-slope*min1, name="Precipitation (mm)"))+
+  coord_cartesian(xlim=c(0,800))
+
+p5_2<-ggplot(data1, aes(y=rld_cm.per.cm2, x=Days, color=Arrival))+
+  geom_line(data=newdata, aes(x=Days, y=pred, color=Arrival), inherit.aes = FALSE, size=0.6)+
+  stat_summary(fun.data="mean_cl_boot", position=position_dodge(width=10), size=0.05, alpha=0.8)+
+  scale_color_manual(values=colors[-5], name="PFG order of arrival")+
+  theme_bw()+
+  ylab("Planar root length density (cm/cm²)")+
+  xlab("Time since start (days)")+
+  scale_x_continuous(breaks=seq(0, 800, by=100))+
+  theme(legend.position = "bottom",
+        axis.title.x.top = element_blank(),
+        axis.title.y.left = element_text(margin=margin(r=10)),
+        axis.title.x.bottom = element_text(margin=margin(t=10)),
+        axis.text=element_text(color="black", size=11),
+        axis.title=element_text(size=12))+
+  scale_y_continuous(breaks=seq(0,8,by=1))+
+  coord_cartesian(xlim=c(0,800))
+
+(p5<-ggarrange(p5_1, p5_2, ncol=1, nrow=2, align="v", heights = c(0.35,0.65)))
+
+#Export high resolution image
+
+# ggsave("Figure5.tiff",
+#        p5,
+#        dpi=1000,
+#        width=18,
+#        height=17,
+#        units="cm",
+#        compression="lzw")
+```
+
+#### Planar root surface area
+
+```{r message=FALSE, warning=FALSE, fig.align="center"}
+#Calculate average root length density per plot 
+data1<-data_root %>%
+  group_by(Plot, Arrival, Days) %>%
+  summarise(rld_inverseCV=mean(rld_cm.per.cm2)/sd(rld_cm.per.cm2),
+            rsd_inverseCV=mean(rsd_cm2.per.cm2)/sd(rsd_cm2.per.cm2),
+            rld_cm.per.cm2=mean(rld_cm.per.cm2),
+            rsd_cm2.per.cm2=mean(rsd_cm2.per.cm2))
+
+#Plot raw data
+supp.labs <- c("Forbs sown first (F)", 
+               "Grasses sown first (G)", 
+               "Legumes sown first (L)", 
+               "Synchronous sowing (S)")
+names(supp.labs) <- c("F", "G", "L", "S")
+
+ggplot(data1, aes(y=rsd_cm2.per.cm2, x=Days, color=Arrival))+
+  geom_smooth(method="loess")+
+  geom_point()+
+  scale_color_manual(values=colors[-5], name="PFG order of arrival")+
+  theme_bw()+
+  ylab("Planar root surface area (cm²/cm²)")+
+  xlab("Time since start (days)")+
+  #scale_x_continuous(breaks=unique(data_root$Days))+
+  theme(legend.position = "none",
+        axis.text.x.top = element_text(angle=40, hjust = 0, vjust=0),
+        axis.title.x.top = element_blank(),
+        axis.title.y.left = element_text(margin=margin(r=10)),
+        axis.title.x.bottom = element_text(margin=margin(t=10)),
+        axis.text=element_text(color="black"))+
+  scale_y_continuous(breaks=seq(0,10,by=1))+
+  coord_cartesian(xlim=c(0,800))+
+  facet_wrap(~Arrival, labeller = labeller(Arrival = supp.labs))
+
+#Fit GAM
+n.time<-length(unique(data_root$Days))
+
+model.s5<-mgcv::gam(rsd_cm2.per.cm2~Arrival+s(Days, by=Arrival, k=n.time)+s(Plot, bs="re"), 
+                    data = data1, 
+                    family=tw(link="log"))
+
+#Check model fit
+gam.check(model.s5, rep=500)
+summary(model.s5)
+anova(model.s5) #ANOVA table
+
+#Make predictions using GAM
+a<-c("G","S","F","S","L","F","G","S","F","L","L","S","L","F","L","G","G","F","S","G")
+
+n<-length(seq(min(data_root$Days),max(data_root$Days),by=1))
+
+newdata<-data.frame(Days=rep(seq(min(data_root$Days),max(data_root$Days),by=1), 20),
+                    Plot=factor(rep(unique(data_root$Plot), each=n)),
+                    Arrival=factor(rep(a, each=n)))
+
+#Predict without random effect smooths
+newdata$pred<-mgcv::predict.gam(model.s5, 
+                                newdata=newdata, 
+                                type="response", 
+                                se=TRUE, 
+                                exclude=c("s(Plot)"))$fit
+
+newdata$se<-mgcv::predict.gam(model.s5, 
+                              newdata=newdata, 
+                              type="response", 
+                              se=TRUE, 
+                              exclude=c("s(Plot)"))$se.fit
+
+#Predict with random effect smooths
+newdata$pred_all<-mgcv::predict.gam(model.s5, 
+                                    newdata=newdata, 
+                                    type="response", 
+                                    se=TRUE)$fit
+
+newdata$se_all<-mgcv::predict.gam(model.s5, 
+                                  newdata=newdata, 
+                                  type="response", 
+                                  se=TRUE)$se.fit
+
+#Plot results (with random effects)
+ggplot(data1, aes(y=rsd_cm2.per.cm2, x=Days, color=Arrival))+
+  geom_line(data=newdata, aes(x=Days, y=pred_all, color=Arrival, group=Plot), 
+            inherit.aes = FALSE, size=0.8)+
+  geom_point(shape=1)+
+  scale_color_manual(values=colors[-5], name="PFG order of arrival")+
+  theme_bw()+
+  ylab("Planar root surface area (cm²/cm²)")+
+  xlab("Time since start (days)")+
+  #scale_x_continuous(breaks=unique(data_root$Days))+
+  theme(legend.position = "bottom",
+        axis.text.x.top = element_text(angle=40, hjust = 0, vjust=0),
+        axis.title.x.top = element_blank(),
+        axis.title.y.left = element_text(margin=margin(r=10)),
+        axis.title.x.bottom = element_text(margin=margin(t=10)),
+        axis.text=element_text(color="black"))+
+  #scale_y_continuous(breaks=seq(0,8,by=1))+
+  coord_cartesian(xlim=c(0,800))
+```
+
+
+```{r fig.align="center", fig.height=6.3, fig.width=7.09, message=FALSE, warning=FALSE}
+#Plot results and model fit
+
+s5_1<-ggplot(weather, aes(x=Days, y=avg_temp))+
+  geom_ribbon(aes(ymin=min_temp, ymax=max_temp), 
+              fill="gray50", color=NA, alpha=0.2)+
+  geom_segment(aes(x=Days, xend=Days, y=(0-min2+slope*min1)/slope, yend=new), 
+               colour="steelblue", size=0.6)+
+  geom_line(size=0.3)+
+  theme_bw()+
+  xlab("")+
+  ylab("Temperature (°C)")+
+  theme(axis.title.y.left = element_text(margin=margin(r=10)),
+        axis.title.y.right=element_text(margin = margin(l=10)),
+        axis.text=element_text(color="black"),
+        axis.text.x.top = element_text(angle=90, hjust = 1, vjust=0.5, size=5.5),
+        axis.text.x.bottom = element_text(angle=90, hjust = 1, vjust=0.5, size=5.5),
+        axis.title.x.top = element_blank(),
+        axis.title.x.bottom = element_blank(),
+        panel.grid.minor = element_blank())+
+  scale_x_continuous(breaks=floor(unique(data_root$Days)),
+                     sec.axis = dup_axis(labels = function(x) {weather$Date[match(floor(x), weather$Days)]}))+
+  scale_y_continuous(sec.axis=sec_axis(~.*slope+min2-slope*min1, name="Precipitation (mm)"))+
+  coord_cartesian(xlim=c(0,800))
+
+s5_2<-ggplot(data1, aes(y=rsd_cm2.per.cm2, x=Days, color=Arrival))+
+  geom_line(data=newdata, aes(x=Days, y=pred, color=Arrival), inherit.aes = FALSE, size=0.6)+
+  stat_summary(fun.data="mean_cl_boot", position=position_dodge(width=10), size=0.05, alpha=0.8)+
+  scale_color_manual(values=colors[-5], name="PFG order of arrival")+
+  theme_bw()+
+  ylab("Planar root surface density (cm²/cm²)")+
+  xlab("Time since start (days)")+
+  scale_x_continuous(breaks=seq(0, 800, by=100))+
+  theme(legend.position = "bottom",
+        axis.title.x.top = element_blank(),
+        axis.title.y.left = element_text(margin=margin(r=10)),
+        axis.title.x.bottom = element_text(margin=margin(t=10)),
+        axis.text=element_text(color="black", size=11),
+        axis.title=element_text(size=12))+
+  scale_y_continuous(breaks=seq(0,0.08,by=0.01))+
+  coord_cartesian(xlim=c(0,800))
+
+(s5<-ggarrange(s5_1, s5_2, ncol=1, nrow=2, align="v", heights = c(0.35,0.65)))
+
+#Export high resolution image
+
+# ggsave("Figure_s5.tiff",
+#        s5,
+#        dpi=1000,
+#        width=18,
+#        height=17,
+#        units="cm",
+#        compression="lzw")
+```
+
+### Analysis of root distribution
+
+#### Planar root length density
+
+##### Average rooting depth
+
+```{r message=FALSE, warning=FALSE, fig.align="center"}
+#Calculate average rooting depth per tube
+data2<-data_root %>%
+  filter(Days>100) %>%
+  group_by(Plot, Arrival, Days) %>%
+  summarise(avg.rooting.depth.rld_cm=sum(rld_cm.per.cm2*Depth_cm)/sum(rld_cm.per.cm2),
+            avg.rooting.depth.rsd_cm=sum(rsd_cm2.per.cm2*Depth_cm)/sum(rsd_cm2.per.cm2))
+
+#Fit GAM
+n.time<-length(unique(data2$Days))
+
+model.f6_mrd<-mgcv::gam(avg.rooting.depth.rld_cm~Arrival+s(Days, by=Arrival, k=n.time)+s(Plot, bs="re"), 
+                         data = data2, 
+                         family=tw(link="log"))
+
+#Check model fit
+gam.check(model.f6_mrd, rep=500)
+summary(model.f6_mrd)
+anova(model.f6_mrd) #ANOVA table
+summary(emmeans(model.f6_mrd, 
+                "Arrival", 
+                contr="pairwise"),
+        type="response")
+summary(emmeans(model.f6_mrd, 
+                "Arrival", 
+                by="Days", 
+                at=list(Days=unique(data2$Days)), 
+                contr="pairwise"),
+        type="response")
+
+#Make predictions using GAM
+a<-c("G","S","F","S","L","F","G","S","F","L","L","S","L","F","L","G","G","F","S","G")
+
+n<-length(seq(min(data2$Days),max(data2$Days),by=1))
+
+newdata<-data.frame(Days=rep(seq(min(data2$Days),max(data2$Days),by=1), 20),
+                    Plot=factor(rep(unique(data_root$Plot), each=n)),
+                    Arrival=factor(rep(a, each=n)))
+
+#Predict without random effect smooths
+newdata$pred<-mgcv::predict.gam(model.f6_mrd, 
+                                newdata=newdata, 
+                                type="response", 
+                                se=TRUE, 
+                                exclude=c("s(Plot)"))$fit 
+
+newdata$se<-mgcv::predict.gam(model.f6_mrd, 
+                              newdata=newdata, 
+                              type="response", 
+                              se=TRUE, 
+                              exclude=c("s(Plot)", "s(Tube)"))$se.fit
+
+#Predict with random effect smooths
+newdata$pred_all<-mgcv::predict.gam(model.f6_mrd, 
+                                    newdata=newdata, 
+                                    type="response", 
+                                    se=TRUE)$fit
+
+newdata$se_all<-mgcv::predict.gam(model.f6_mrd, 
+                                  newdata=newdata, 
+                                  type="response", 
+                                  se=TRUE)$se.fit
+
+#Plot results (with random effects)
+ggplot(data2, aes(y=-avg.rooting.depth.rld_cm, x=Days, color=Arrival))+
+  geom_line(data=newdata, aes(x=Days, y=-pred_all, color=Arrival, group=Plot), 
+            inherit.aes = FALSE, size=0.8)+
+  geom_point(shape=1)+
+  scale_color_manual(values=colors[-5], name="PFG order of arrival")+
+  theme_bw()+
+  ylab("Average rooting depth (cm)")+
+  xlab("Time since start (days)")+
+  theme(legend.position = "bottom",
+        axis.text.x.top = element_text(angle=40, hjust = 0, vjust=0),
+        axis.title.x.top = element_blank(),
+        axis.title.y.left = element_text(margin=margin(r=10)),
+        axis.title.x.bottom = element_text(margin=margin(t=10)),
+        axis.text=element_text(color="black"))+
+  coord_cartesian(xlim=c(100,800))
+```
+
+##### Root distribution as a function of time and depth
+
+```{r message=FALSE, warning=FALSE, fig.align="center"}
+newdata_avg.root.depth<-newdata
+
+#Fit model
+model.f6<-mgcv::gam(rld_cm.per.cm2~Arrival+te(Days, Depth_cm, by=Arrival)+s(Plot, bs="re"), 
+                     data=data_root, 
+                     family=tw(link="log"))
+
+#Check model fit
+gam.check(model.f6, rep=500)
+summary(model.f6)
+anova(model.f6) #ANOVA table
+
+#Make predictions using GAM
+a<-c("G","S","F","S","L","F","G","S","F","L","L","S","L","F","L","G","G","F","S","G")
+days<-seq(min(data_root$Days),max(data_root$Days),by=0.5)
+depths<-seq(min(data_root$Depth_cm),max(data_root$Depth_cm),by=0.25)
+
+n.days<-length(days)
+n.depths<-length(depths)
+
+newdata<-data.frame(Plot=factor(rep(unique(data_root$Plot), each=n.depths*n.days)),
+                    Arrival=factor(rep(a, each=n.depths*n.days)),
+                    Days=rep(rep(days, n.depths),20),
+                    Depth_cm=rep(rep(depths, each=n.days),20))
+
+newdata$Arrival<-factor(newdata$Arrival, levels = c("S", "F", "G", "L"))
+
+#Predict without random effect smooths
+
+newdata$pred<-mgcv::predict.gam(model.f6, 
+                                newdata=newdata, 
+                                type="response", 
+                                se=TRUE, 
+                                exclude=c("s(Plot)"))$fit 
+
+# newdata$se<-mgcv::predict.gam(model.f6, 
+#                               newdata=newdata, 
+#                               type="response", 
+#                               se=TRUE, 
+#                               exclude=c("s(Plot)"))$se.fit
+
+#Predict with random effect smooths
+
+newdata$pred_all<-mgcv::predict.gam(model.f6, 
+                                    newdata=newdata, 
+                                    type="response", 
+                                    se=TRUE)$fit
+
+# newdata$se_all<-mgcv::predict.gam(model.f6, 
+#                                   newdata=newdata, 
+#                                   type="response", 
+#                                   se=TRUE)$se.fit
+```
+
+
+```{r fig.align="center", fig.height=3.15, fig.width=7.09, message=FALSE, warning=FALSE}
+#Plot model predictions
+
+supp.labs <- c("Forbs sown first (F)", "Grasses sown first (G)", "Legumes sown first (L)", "Synchronous sowing (S)")
+names(supp.labs) <- c("F", "G", "L", "S")
+
+f6<-newdata %>% filter(Plot %in% c(201,202,203,205)) %>%
+  ggplot(aes(x=Days, y=-Depth_cm, z=pred))+
+  geom_raster(aes(fill=pred))+
+  geom_contour(colour="black", bins=12, size=0.3, linetype=3)+
+  stat_summary(data=data2,
+               mapping=aes(x=Days, y=-avg.rooting.depth.rld_cm),
+               color="white",
+               shape=16,
+               size=0.01,
+               fun.data="mean_cl_boot",
+               inherit.aes = FALSE,
+               alpha=0.6)+
+  stat_summary(data=data2,
+               mapping=aes(x=Days, y=-avg.rooting.depth.rld_cm),
+               color="white",
+               shape=16,
+               size=0.4,
+               fun="mean",
+               inherit.aes = FALSE,
+               alpha=1,
+               geom="point")+
+  geom_line(data=newdata_avg.root.depth,
+            mapping=aes(x=Days, y=-pred, color=Arrival),
+            inherit.aes = FALSE,
+            linewidth=0.7)+
+  geom_line(data=newdata_avg.root.depth,
+            mapping=aes(x=Days, y=-pred-2*se, color=Arrival),
+            inherit.aes = FALSE,
+            linetype=2, 
+            linewidth=0.3)+
+  geom_line(data=newdata_avg.root.depth,
+            mapping=aes(x=Days, y=-pred+2*se, color=Arrival),
+            inherit.aes = FALSE,
+            linetype=2, 
+            linewidth=0.3)+
+  facet_wrap(~Arrival, 
+             labeller = labeller(Arrival = supp.labs),
+             nrow=1)+
+  scale_fill_viridis(direction=1, name="Planar\nroot\nlength\ndensity\n(cm/cm²)",
+                     option = "B")+
+  scale_color_manual(values=colors[-5], guide="none")+
+  theme_bw()+
+  ylab("Soil depth (cm)")+
+  xlab("Time since start (days)")+
+  scale_y_continuous(breaks=seq(0,-50, by=-5))+
+  theme(axis.title.y.left = element_text(margin=margin(r=10)),
+        axis.title.x.bottom = element_text(margin=margin(t=10)),
+        axis.text=element_text(color="black", size=7),
+        axis.title=element_text(size=8),
+        strip.text=element_text(size=8),
+        legend.title=element_text(size=8),
+        legend.text=element_text(size=7))
+
+#Export high resolution figure
+
+# ggsave("Figure6.pdf",
+#        f6,
+#        dpi=1000,
+#        width=20,
+#        height=9,
+#        units="cm")
+
+# ggsave("Figure6.tiff",
+#        f6,
+#        dpi=1000,
+#        compression="lzw",
+#        width=20,
+#        height=9,
+#        units="cm")
+```
+
+```{r fig.align="center", message=FALSE, warning=FALSE}
+#Plot model predictions for each plot (raster)
+newdata %>%
+  ggplot(aes(x=Days, y=-Depth_cm, z=pred_all))+
+  geom_raster(aes(fill=pred_all))+
+  geom_contour(colour="black", bins=12, size=0.5, linetype=3)+
+  facet_wrap(~Plot)+
+  scale_fill_viridis(direction=1, name="Planar\nroot\nlength\ndensity\n(cm/cm²)",
+                     option = "B")+
+  theme_bw()+
+  ylab("Soil depth (cm)")+
+  xlab("Time since start (days)")+
+  theme(axis.title.y.left = element_text(margin=margin(r=10)),
+        axis.title.x.bottom = element_text(margin=margin(t=10)),
+        axis.text.x = element_text(angle=45, hjust = 1, vjust=1),
+        axis.text=element_text(color="black"))
+```
+
+#### Planar root surface area
+
+##### Average rooting depth
+
+```{r message=FALSE, warning=FALSE, fig.align="center"}
+#Calculate average rooting depth per tube
+data2<-data_root %>%
+  filter(Days>100) %>%
+  group_by(Plot, Arrival, Days) %>%
+  summarise(avg.rooting.depth.rld_cm=sum(rld_cm.per.cm2*Depth_cm)/sum(rld_cm.per.cm2),
+            avg.rooting.depth.rsd_cm=sum(rsd_cm2.per.cm2*Depth_cm)/sum(rsd_cm2.per.cm2))
+
+#Fit GAM
+n.time<-length(unique(data2$Days))
+
+model.s6_mrd<-mgcv::gam(avg.rooting.depth.rsd_cm~Arrival+s(Days, by=Arrival, k=n.time)+s(Plot, bs="re"), 
+                         data = data2, 
+                         family=tw(link="log"))
+
+#Check model fit
+gam.check(model.s6_mrd, rep=500)
+summary(model.s6_mrd)
+anova(model.s6_mrd) #ANOVA table
+summary(emmeans(model.s6_mrd, 
+                "Arrival", 
+                contr="pairwise"),
+        type="response")
+summary(emmeans(model.s6_mrd, 
+                "Arrival", 
+                by="Days", 
+                at=list(Days=unique(data2$Days)), 
+                contr="pairwise"),
+        type="response")
+
+#Make predictions using GAM
+a<-c("G","S","F","S","L","F","G","S","F","L","L","S","L","F","L","G","G","F","S","G")
+
+n<-length(seq(min(data2$Days),max(data2$Days),by=1))
+
+newdata<-data.frame(Days=rep(seq(min(data2$Days),max(data2$Days),by=1), 20),
+                    Plot=factor(rep(unique(data_root$Plot), each=n)),
+                    Arrival=factor(rep(a, each=n)))
+
+#Predict without random effect smooths
+newdata$pred<-mgcv::predict.gam(model.s6_mrd, 
+                                newdata=newdata, 
+                                type="response", 
+                                se=TRUE, 
+                                exclude=c("s(Plot)"))$fit
+
+newdata$se<-mgcv::predict.gam(model.s6_mrd, 
+                              newdata=newdata, 
+                              type="response", 
+                              se=TRUE, 
+                              exclude=c("s(Plot)", "s(Tube)"))$se.fit
+
+#Predict with random effect smooths
+newdata$pred_all<-mgcv::predict.gam(model.s6_mrd, 
+                                    newdata=newdata, 
+                                    type="response", 
+                                    se=TRUE)$fit 
+
+newdata$se_all<-mgcv::predict.gam(model.s6_mrd, 
+                                  newdata=newdata, 
+                                  type="response", 
+                                  se=TRUE)$se.fit
+
+#Plot results (with random effects)
+ggplot(data2, aes(y=-avg.rooting.depth.rsd_cm, x=Days, color=Arrival))+
+  geom_line(data=newdata, aes(x=Days, y=-pred_all, color=Arrival, group=Plot), 
+            inherit.aes = FALSE, size=0.8)+
+  geom_point(shape=1)+
+  scale_color_manual(values=colors[-5], name="PFG order of arrival")+
+  theme_bw()+
+  ylab("Average rooting depth (cm)")+
+  xlab("Time since start (days)")+
+  theme(legend.position = "bottom",
+        axis.text.x.top = element_text(angle=40, hjust = 0, vjust=0),
+        axis.title.x.top = element_blank(),
+        axis.title.y.left = element_text(margin=margin(r=10)),
+        axis.title.x.bottom = element_text(margin=margin(t=10)),
+        axis.text=element_text(color="black"))+
+  coord_cartesian(xlim=c(100,800))
+```
+
+##### Root distribution as a function of time and depth
+
+```{r message=FALSE, warning=FALSE, fig.align="center"}
+newdata_avg.root.depth<-newdata
+
+#Fit model
+model.s6<-mgcv::gam(rsd_cm2.per.cm2~Arrival+te(Days, Depth_cm, by=Arrival)+s(Plot, bs="re"), 
+                     data=data_root, 
+                     family=tw(link="log"))
+
+#Check model fit
+gam.check(model.s6, rep=500)
+summary(model.s6)
+anova(model.s6) #ANOVA table
+
+#Make predictions using GAM
+a<-c("G","S","F","S","L","F","G","S","F","L","L","S","L","F","L","G","G","F","S","G")
+days<-seq(min(data_root$Days),max(data_root$Days),by=0.5)
+depths<-seq(min(data_root$Depth_cm),max(data_root$Depth_cm),by=0.25)
+
+n.days<-length(days)
+n.depths<-length(depths)
+
+newdata<-data.frame(Plot=factor(rep(unique(data_root$Plot), each=n.depths*n.days)),
+                    Arrival=factor(rep(a, each=n.depths*n.days)),
+                    Days=rep(rep(days, n.depths),20),
+                    Depth_cm=rep(rep(depths, each=n.days),20))
+
+newdata$Arrival<-factor(newdata$Arrival, levels = c("S", "F", "G", "L"))
+
+#Predict without random effect smooths
+
+newdata$pred<-mgcv::predict.gam(model.s6, 
+                                newdata=newdata, 
+                                type="response", 
+                                se=TRUE, 
+                                exclude=c("s(Plot)"))$fit 
+
+# newdata$se<-mgcv::predict.gam(model.s6, 
+#                               newdata=newdata, 
+#                               type="response", 
+#                               se=TRUE, 
+#                               exclude=c("s(Plot)"))$se.fit
+
+#Predict with random effect smooths
+
+newdata$pred_all<-mgcv::predict.gam(model.s6, 
+                                    newdata=newdata, 
+                                    type="response", 
+                                    se=TRUE)$fit
+
+# newdata$se_all<-mgcv::predict.gam(model.s6, 
+#                                   newdata=newdata, 
+#                                   type="response", 
+#                                   se=TRUE)$se.fit
+```
+
+```{r message=FALSE, warning=FALSE, fig.align="center", fig.height=3.15, fig.width=7.09}
+#Plot model predictions
+
+supp.labs <- c("Forbs sown first (F)", "Grasses sown first (G)", "Legumes sown first (L)", "Synchronous sowing (S)")
+names(supp.labs) <- c("F", "G", "L", "S")
+
+s6<-newdata %>% filter(Plot %in% c(201,202,203,205)) %>%
+  ggplot(aes(x=Days, y=-Depth_cm, z=pred))+
+  geom_raster(aes(fill=pred))+
+  geom_contour(colour="black", bins=12, size=0.3, linetype=3)+
+  stat_summary(data=data2,
+               mapping=aes(x=Days, y=-avg.rooting.depth.rsd_cm),
+               color="white",
+               shape=16,
+               size=0.01,
+               fun.data="mean_cl_boot",
+               inherit.aes = FALSE,
+               alpha=0.6)+
+    stat_summary(data=data2,
+               mapping=aes(x=Days, y=-avg.rooting.depth.rsd_cm),
+               color="white",
+               shape=16,
+               size=0.4,
+               fun="mean",
+               inherit.aes = FALSE,
+               alpha=1,
+               geom="point")+
+  geom_line(data=newdata_avg.root.depth,
+            mapping=aes(x=Days, y=-pred, color=Arrival),
+            inherit.aes = FALSE,
+            size=0.7)+
+  geom_line(data=newdata_avg.root.depth,
+            mapping=aes(x=Days, y=-pred-2*se, color=Arrival),
+            inherit.aes = FALSE,
+            linetype=2, 
+            size=0.3)+
+  geom_line(data=newdata_avg.root.depth,
+            mapping=aes(x=Days, y=-pred+2*se, color=Arrival),
+            inherit.aes = FALSE,
+            linetype=2, 
+            size=0.3)+
+  facet_wrap(~Arrival, 
+             labeller = labeller(Arrival = supp.labs),
+             nrow=1)+
+  scale_fill_viridis(direction=1, name="Planar\nroot\nsurface\ndensity\n(cm²/cm²)",
+                     option = "B")+
+  scale_color_manual(values=colors[-5], guide="none")+
+  theme_bw()+
+  ylab("Soil depth (cm)")+
+  xlab("Time since start (days)")+
+  scale_y_continuous(breaks=seq(0,-50, by=-5))+
+  theme(axis.title.y.left = element_text(margin=margin(r=10)),
+        axis.title.x.bottom = element_text(margin=margin(t=10)),
+        axis.text=element_text(color="black", size=7),
+        axis.title=element_text(size=8),
+        strip.text=element_text(size=8),
+        legend.title=element_text(size=8),
+        legend.text=element_text(size=7))
+
+#Export high resolution figure
+
+# ggsave("Figure_s6.tiff",
+#        s6,
+#        dpi=1000,
+#        compression="lzw",
+#        width=20,
+#        height=9,
+#        units="cm")
+```
